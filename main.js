@@ -628,9 +628,10 @@
             // Expose start/stop so the TEDDY module toggle controls the interval
             let _timerId = null;
             let _running = false;
+            const AUTO_ANSWER_MIN_DELAY_MS = 25;
             let _baseSpeed = 1000;
             let _pardyDelay = 1500;
-            const BLUEBOAT_EXTRA_DELAY_MS = 500;
+            const BLUEBOAT_EXTRA_DELAY_MS = 0;
 
             function getCurrentDelay() {
                 if (socketManager.transportType === "blueboat") return _baseSpeed + BLUEBOAT_EXTRA_DELAY_MS;
@@ -639,7 +640,7 @@
 
             function scheduleNextTick() {
                 if (!_running) return;
-                const delay = Math.max(200, Number(getCurrentDelay()) || 1000);
+                const delay = Math.max(AUTO_ANSWER_MIN_DELAY_MS, Number(getCurrentDelay()) || 1000);
                 _timerId = setTimeout(() => {
                     answerQuestion();
                     scheduleNextTick();
@@ -648,7 +649,7 @@
 
             function startAutoAnswer(speed = 1000, source = "module toggle", options = {}) {
                 const cfg = window.__TEDDYAutoAnswerConfig || {};
-                _baseSpeed = Math.max(200, Number(speed ?? cfg.speed) || 1000);
+                _baseSpeed = Math.max(AUTO_ANSWER_MIN_DELAY_MS, Number(speed ?? cfg.speed) || 1000);
                 const pardyDelayNumber = Number(options?.pardyDelay ?? cfg.triviaDelay);
                 _pardyDelay = Math.max(0, Math.min(8000, Number.isFinite(pardyDelayNumber) ? pardyDelayNumber : _pardyDelay));
                 const wasRunning = _running;
@@ -1196,6 +1197,7 @@
                         ? { ...blueboatDecoded.payload, eventName: blueboatDecoded.eventName, payload: blueboatDecoded.payload, raw: blueboatDecoded.raw }
                         : blueboatDecoded;
                     this.dispatchEvent(new CustomEvent("blueboatMessage", { detail: normalizedBlueboat }));
+                    this.dispatchEvent(new CustomEvent("recieveMessage", { detail: normalizedBlueboat }));
                 }
                 const firstByte = (() => {
                     try {
@@ -1289,6 +1291,7 @@
         panel: null,
         status: null,
         latestPeople: null,
+        lastPacketAt: 0,
     };
 
     function ensureTrustNoOnePanel() {
@@ -1349,24 +1352,93 @@
     function renderTrustNoOneImposters() {
         if (!trustNoOneState.enabled) return;
         ensureTrustNoOnePanel();
-        const people = Array.isArray(trustNoOneState.latestPeople) ? trustNoOneState.latestPeople : [];
-        const imposters = people.filter((person) => person?.role === "imposter");
-        const names = imposters.map((person) => String(person?.name || "Unknown"));
+        if (!Array.isArray(trustNoOneState.latestPeople)) {
+            trustNoOneState.status.textContent = "Imposters: Waiting... (join before the round starts)";
+            return;
+        }
+        const people = trustNoOneState.latestPeople;
+        const imposters = people.filter(isTrustNoOneImposter);
+        const names = imposters.map(getTrustNoOnePersonName);
         trustNoOneState.status.textContent = names.length
             ? `Imposter(s): ${names.join(", ")}`
-            : "Imposters: Waiting...";
+            : "Imposters: None found yet";
+    }
+
+    function getTrustNoOnePersonName(person) {
+        return String(person?.name ?? person?.nickname ?? person?.displayName ?? person?.userName ?? person?.username ?? person?.id ?? "Unknown");
+    }
+
+    function isTrustNoOneImposter(person) {
+        if (!person || typeof person !== "object") return false;
+        const role = String(person.role ?? person.modeRole ?? person.playerRole ?? person.team ?? person.type ?? "").toLowerCase();
+        if (["imposter", "impostor", "traitor"].includes(role)) return true;
+        return person.isImposter === true || person.imposter === true || person.isImpostor === true || person.impostor === true;
+    }
+
+    function normalizeTrustNoOnePeople(value, depth = 0) {
+        if (depth > 5 || value == null) return null;
+        if (Array.isArray(value)) {
+            if (value.some((item) => item && typeof item === "object" && (
+                "role" in item || "modeRole" in item || "playerRole" in item || "isImposter" in item || "imposter" in item || "isImpostor" in item || "impostor" in item
+            ))) {
+                return value;
+            }
+            for (const item of value) {
+                const nested = normalizeTrustNoOnePeople(item, depth + 1);
+                if (nested) return nested;
+            }
+            return null;
+        }
+        if (typeof value !== "object") return null;
+
+        for (const key of ["people", "players", "users", "members", "data", "value", "payload"]) {
+            const nested = normalizeTrustNoOnePeople(value[key], depth + 1);
+            if (nested) return nested;
+        }
+        const objectValues = Object.values(value);
+        if (objectValues.length && objectValues.every((item) => item && typeof item === "object")) {
+            const nested = normalizeTrustNoOnePeople(objectValues, depth + 1);
+            if (nested) return nested;
+        }
+        return null;
+    }
+
+    function getTrustNoOnePayloadFromPacket(packet, depth = 0) {
+        if (depth > 5 || !packet || typeof packet !== "object") return null;
+        if (Array.isArray(packet)) {
+            for (const item of packet) {
+                const payload = getTrustNoOnePayloadFromPacket(item, depth + 1);
+                if (payload) return payload;
+            }
+            return null;
+        }
+        if (packet.key === "IMPOSTER_MODE_PEOPLE") return packet.data ?? packet.value ?? packet.payload ?? null;
+
+        const candidates = [
+            packet?.payload,
+            packet?.data,
+            packet?.value,
+            packet?.raw,
+            Array.isArray(packet?.raw?.data) ? packet.raw.data[1] : null,
+            Array.isArray(packet?.data) ? packet.data[1] : null,
+        ];
+        for (const candidate of candidates) {
+            const payload = getTrustNoOnePayloadFromPacket(candidate, depth + 1);
+            if (payload) return payload;
+        }
+        return null;
     }
 
     function getTrustNoOnePeopleFromPacket(packet) {
-        const key = packet?.key ?? packet?.payload?.key ?? packet?.data?.key;
-        if (key !== "IMPOSTER_MODE_PEOPLE") return null;
-        return packet?.data ?? packet?.payload?.data ?? null;
+        const payload = getTrustNoOnePayloadFromPacket(packet);
+        return normalizeTrustNoOnePeople(payload);
     }
 
     function handleTrustNoOnePacket(event) {
         const people = getTrustNoOnePeopleFromPacket(event?.detail);
         if (!Array.isArray(people)) return;
         trustNoOneState.latestPeople = people;
+        trustNoOneState.lastPacketAt = Date.now();
         renderTrustNoOneImposters();
     }
 
@@ -1374,7 +1446,10 @@
         if (trustNoOneState.listenerInstalled) return;
         trustNoOneState.listenerInstalled = true;
         socketManager.addEventListener("blueboatMessage", handleTrustNoOnePacket);
+        socketManager.addEventListener("recieveMessage", handleTrustNoOnePacket);
     }
+
+    installTrustNoOneListener();
 
     function startTrustNoOne() {
         trustNoOneState.enabled = true;
@@ -1554,7 +1629,7 @@
         questionIdList: [],
         currentQuestionIndex: -1,
     };
-    const AUTO_ANSWER_TICK = 1000;
+    const AUTO_ANSWER_TICK = 50;
     let autoAnswerEnabled = false;
     let answerInterval = null;
 
@@ -1712,6 +1787,17 @@
     const CAMERA_ZOOM_MAX = 2.0;
     const CAMERA_ZOOM_STEP = 0.05;
     const CAMERA_ZOOM_DEFAULT = 0.8;
+    const FREECAM_MODULE_NAME = "Freecam";
+    const freecamState = {
+        enabled: false,
+        active: false,
+        keys: new Set(),
+        freeCamPos: { x: 0, y: 0 },
+        cameraRef: null,
+        originalUseBounds: null,
+        listenersInstalled: false,
+        retryId: null,
+    };
 
     function espLog(message, extra) {
         if (extra !== undefined) console.log(`${ESP_LOG} ${message}`, extra);
@@ -1767,6 +1853,206 @@
 
     function resolvePrimaryCamera() {
         return window?.stores?.phaser?.scene?.cameras?.cameras?.[0] || null;
+    }
+
+    function resolvePhaserState() {
+        return window?.stores?.phaser || null;
+    }
+
+    function resolveCameraHelper() {
+        return resolvePhaserState()?.scene?.cameraHelper || null;
+    }
+
+    function resolveMainCharacterBody() {
+        const phaser = resolvePhaserState();
+        const mainId = phaser?.mainCharacter?.id;
+        const characters = phaser?.scene?.characterManager?.characters;
+        return (mainId != null ? characters?.get?.(mainId)?.body : null) || phaser?.mainCharacter?.body || null;
+    }
+
+    function isGameplayReadyForFreecam() {
+        const loading = window?.stores?.loading;
+        const loaded = !loading || (
+            Number(loading.percentageAssetsLoaded) >= 100
+            && loading.completedInitialLoad
+            && loading.loadedInitialDevices
+            && loading.loadedInitialTerrain
+        );
+        const phaser = resolvePhaserState();
+        return Boolean(
+            loaded
+            && resolvePrimaryCamera()
+            && resolveMainCharacterBody()
+            && phaser?.mainCharacter?.id
+            && phaser?.mainCharacter?.teamId
+            && phaser.mainCharacter.teamId !== "__NO_TEAM_ID"
+        );
+    }
+
+    function installFreecamKeyListeners() {
+        if (freecamState.listenersInstalled) return;
+        freecamState.listenersInstalled = true;
+        const movementKeys = new Set(["arrowup", "arrowdown", "arrowleft", "arrowright", "w", "a", "s", "d", "shift"]);
+        const isTypingTarget = (target) => {
+            if (!(target instanceof Element)) return false;
+            return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+        };
+
+        document.addEventListener("keydown", (event) => {
+            if (!freecamState.enabled || !freecamState.active || isTypingTarget(event.target)) return;
+            const key = String(event.key || "").toLowerCase();
+            if (!movementKeys.has(key)) return;
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            freecamState.keys.add(key);
+        }, true);
+
+        document.addEventListener("keyup", (event) => {
+            const key = String(event.key || "").toLowerCase();
+            if (movementKeys.has(key)) freecamState.keys.delete(key);
+        }, true);
+
+        window.addEventListener("blur", () => {
+            freecamState.keys.clear();
+        });
+    }
+
+    function moveFreecamTo(camera, helper, point) {
+        if (helper && typeof helper.goTo === "function") {
+            helper.goTo(point);
+            return;
+        }
+        if (camera && typeof camera.centerOn === "function") {
+            camera.centerOn(point.x, point.y);
+            return;
+        }
+        if (camera) {
+            const width = Number(camera.width ?? window.innerWidth) || window.innerWidth;
+            const height = Number(camera.height ?? window.innerHeight) || window.innerHeight;
+            const zoom = Number(camera.zoom ?? 1) || 1;
+            camera.scrollX = point.x - width / (2 * zoom);
+            camera.scrollY = point.y - height / (2 * zoom);
+        }
+    }
+
+    function getFreecamConfig() {
+        const cfgStore = state?.moduleConfig instanceof Map ? state.moduleConfig : null;
+        return (cfgStore?.get(FREECAM_MODULE_NAME) && typeof cfgStore.get(FREECAM_MODULE_NAME) === "object")
+            ? cfgStore.get(FREECAM_MODULE_NAME)
+            : { speed: 20 };
+    }
+
+    function applyFreecamTick() {
+        if (!freecamState.enabled || !freecamState.active) return;
+        const camera = resolvePrimaryCamera();
+        if (!camera) return;
+
+        const helper = resolveCameraHelper();
+        if (camera !== freecamState.cameraRef) {
+            if (!freecamState.cameraRef) {
+                freecamState.freeCamPos = {
+                    x: Number(camera?.midPoint?.x ?? camera?.worldView?.centerX ?? 0),
+                    y: Number(camera?.midPoint?.y ?? camera?.worldView?.centerY ?? 0),
+                };
+            }
+            freecamState.cameraRef = camera;
+            freecamState.originalUseBounds = typeof camera.useBounds === "boolean" ? camera.useBounds : null;
+            if (typeof camera.useBounds === "boolean") camera.useBounds = false;
+            if (helper && typeof helper.stopFollow === "function") helper.stopFollow();
+        }
+
+        const cfg = getFreecamConfig();
+        const speed = Math.min(80, Math.max(1, Number(cfg.speed) || 20));
+        if (Number(cfg.speed) !== speed) cfg.speed = speed;
+        const fastMultiplier = freecamState.keys.has("shift") ? 2 : 1;
+        const step = speed * fastMultiplier;
+
+        let dx = 0;
+        let dy = 0;
+        if (freecamState.keys.has("arrowup") || freecamState.keys.has("w")) dy -= 1;
+        if (freecamState.keys.has("arrowdown") || freecamState.keys.has("s")) dy += 1;
+        if (freecamState.keys.has("arrowleft") || freecamState.keys.has("a")) dx -= 1;
+        if (freecamState.keys.has("arrowright") || freecamState.keys.has("d")) dx += 1;
+
+        if (dx !== 0 && dy !== 0) {
+            dx *= Math.SQRT1_2;
+            dy *= Math.SQRT1_2;
+        }
+
+        freecamState.freeCamPos.x += dx * step;
+        freecamState.freeCamPos.y += dy * step;
+        moveFreecamTo(camera, helper, freecamState.freeCamPos);
+    }
+
+    function activateFreecamCamera() {
+        const camera = resolvePrimaryCamera();
+        const helper = resolveCameraHelper();
+        const body = resolveMainCharacterBody();
+        if (!camera || !body || !isGameplayReadyForFreecam()) return false;
+
+        freecamState.active = true;
+        freecamState.cameraRef = camera;
+        freecamState.originalUseBounds = typeof camera.useBounds === "boolean" ? camera.useBounds : null;
+        freecamState.freeCamPos = {
+            x: Number(camera?.midPoint?.x ?? camera?.worldView?.centerX ?? 0),
+            y: Number(camera?.midPoint?.y ?? camera?.worldView?.centerY ?? 0),
+        };
+        if (helper && typeof helper.stopFollow === "function") helper.stopFollow();
+        if (typeof camera.useBounds === "boolean") camera.useBounds = false;
+        moveFreecamTo(camera, helper, freecamState.freeCamPos);
+        startUnifiedRenderLoop();
+        return true;
+    }
+
+    function scheduleFreecamCameraRetry() {
+        if (freecamState.retryId != null) return;
+        freecamState.retryId = setInterval(() => {
+            if (!freecamState.enabled) {
+                clearInterval(freecamState.retryId);
+                freecamState.retryId = null;
+                return;
+            }
+            if (!activateFreecamCamera()) return;
+            clearInterval(freecamState.retryId);
+            freecamState.retryId = null;
+        }, 250);
+    }
+
+    function startFreecam() {
+        if (freecamState.enabled) return;
+        freecamState.enabled = true;
+        freecamState.active = false;
+        freecamState.keys.clear();
+        installFreecamKeyListeners();
+
+        if (!activateFreecamCamera()) {
+            console.warn("[Freecam] Camera is not ready yet; waiting for it.");
+            scheduleFreecamCameraRetry();
+        }
+    }
+
+    function stopFreecam() {
+        if (!freecamState.enabled) return;
+        freecamState.enabled = false;
+        freecamState.active = false;
+        freecamState.keys.clear();
+        if (freecamState.retryId != null) {
+            clearInterval(freecamState.retryId);
+            freecamState.retryId = null;
+        }
+
+        const camera = resolvePrimaryCamera();
+        const helper = resolveCameraHelper();
+        const body = resolveMainCharacterBody();
+        if (helper && body && typeof helper.startFollowingObject === "function") {
+            helper.startFollowingObject({ object: body });
+        }
+        if (camera && freecamState.originalUseBounds !== null) {
+            camera.useBounds = freecamState.originalUseBounds;
+        }
+        freecamState.cameraRef = null;
+        freecamState.originalUseBounds = null;
+        stopUnifiedRenderLoopIfIdle();
     }
 
     function ensureCameraZoomToast() {
@@ -3361,6 +3647,7 @@
         if (autoAimState.enabled) runTimedModule("autoAim", autoAimTick);
         if (triggerAssistState.enabled) runTimedModule("triggerAssist", triggerAssistTick);
         if (cameraZoomState.enabled) runTimedModule("cameraZoom", applyCameraZoomTick);
+        if (freecamState.enabled) runTimedModule("freecam", applyFreecamTick);
 
         unifiedRenderState.rafId = requestAnimationFrame(unifiedRenderTick);
     }
@@ -3372,7 +3659,7 @@
     }
 
     function stopUnifiedRenderLoopIfIdle() {
-        if (espState.enabled || crosshairState.enabled || autoAimState.enabled || triggerAssistState.enabled || cameraZoomState.enabled) return;
+        if (espState.enabled || crosshairState.enabled || autoAimState.enabled || triggerAssistState.enabled || cameraZoomState.enabled || freecamState.active) return;
         unifiedRenderState.running = false;
         if (unifiedRenderState.rafId != null) {
             cancelAnimationFrame(unifiedRenderState.rafId);
@@ -4556,7 +4843,9 @@
 
     const hidePopupsState = {
         enabled: false,
+        active: false,
         observer: null,
+        retryId: null,
         hiddenBuildingPopups: 0,
         hiddenEnergyPopups: 0,
     };
@@ -4630,6 +4919,7 @@
     }
 
     function scanHidePopupNode(node) {
+        if (!hidePopupsState.enabled || !hidePopupsState.active || !isGameplayReadyForFreecam()) return;
         if (!isHidePopupsElement(node)) return;
 
         if (node.matches(HIDE_POPUPS_TOAST_SELECTOR)) hideBuildingPopup(node);
@@ -4664,18 +4954,50 @@
     }
 
     function syncHidePopups() {
-        if (hidePopupsState.enabled) scanHidePopupsDocument();
+        if (hidePopupsState.enabled && hidePopupsState.active) scanHidePopupsDocument();
+    }
+
+    function activateHidePopupsWhenReady() {
+        if (!hidePopupsState.enabled) return false;
+        if (!isGameplayReadyForFreecam()) return false;
+        hidePopupsState.active = true;
+        observeHidePopups();
+        scanHidePopupsDocument();
+        return true;
+    }
+
+    function scheduleHidePopupsRetry() {
+        if (hidePopupsState.retryId != null) return;
+        hidePopupsState.retryId = setInterval(() => {
+            if (!hidePopupsState.enabled) {
+                clearInterval(hidePopupsState.retryId);
+                hidePopupsState.retryId = null;
+                return;
+            }
+            if (!activateHidePopupsWhenReady()) return;
+            clearInterval(hidePopupsState.retryId);
+            hidePopupsState.retryId = null;
+        }, 500);
     }
 
     function startHidePopups() {
         hidePopupsState.enabled = true;
-        observeHidePopups();
-        scanHidePopupsDocument();
+        hidePopupsState.active = false;
+        if (!activateHidePopupsWhenReady()) scheduleHidePopupsRetry();
         hidePopupsLog("Enabled");
     }
 
     function stopHidePopups() {
         hidePopupsState.enabled = false;
+        hidePopupsState.active = false;
+        if (hidePopupsState.retryId != null) {
+            clearInterval(hidePopupsState.retryId);
+            hidePopupsState.retryId = null;
+        }
+        if (hidePopupsState.observer) {
+            hidePopupsState.observer.disconnect();
+            hidePopupsState.observer = null;
+        }
         hidePopupsLog("Disabled");
     }
 
@@ -4687,6 +5009,7 @@
         status() {
             return {
                 enabled: hidePopupsState.enabled,
+                active: hidePopupsState.active,
                 observer: Boolean(hidePopupsState.observer),
                 ...getHidePopupsConfig(),
                 hiddenBuildingPopups: hidePopupsState.hiddenBuildingPopups,
@@ -4702,12 +5025,11 @@
     let animationSkipRouteWatcher = null;
 
     function isLikelyInActiveMatch() {
-        return !!document.querySelector("canvas");
+        return isGameplayReadyForFreecam();
     }
 
     function shouldPauseAnimationSkipForJoinMenu() {
-        const onJoinRoute = String(location?.pathname || "").startsWith("/join");
-        return onJoinRoute && !isLikelyInActiveMatch();
+        return !isLikelyInActiveMatch();
     }
 
     function applyAnimationSkipState(enabled) {
@@ -5689,6 +6011,10 @@
             onEnable: startCameraZoom,
             onDisable: stopCameraZoom,
         },
+        [FREECAM_MODULE_NAME]: {
+            onEnable: startFreecam,
+            onDisable: stopFreecam,
+        },
         [HIDE_POPUPS_MODULE_NAME]: {
             onEnable: startHidePopups,
             onDisable: stopHidePopups,
@@ -5713,6 +6039,7 @@
         "Building HUD": "Shows Floor is Lava build costs and lets you buy builds quickly.",
         [ABILITY_HUD_MODULE_NAME]: "Shows intercepted abilities with live Classic/Tycoon pricing and one-click purchases.",
         [CAMERA_ZOOM_MODULE_NAME]: "Adjust how much you can see on the screen",
+        [FREECAM_MODULE_NAME]: "Unbinds the camera and moves it with WASD or arrow keys.",
         [HIDE_POPUPS_MODULE_NAME]: "Hides Floor is Lava building purchase toasts and energy/resource popups.",
         [ANTI_AFK_MODULE_NAME]: "Sends lightweight synthetic activity pulses to reduce AFK kicks.",
     };
@@ -5730,7 +6057,7 @@
                             name: "Auto Answer",
                             description: MODULE_DESCRIPTIONS["Auto Answer"],
                             settings: [
-                                { id: "speed", label: "Answer Delay", type: "slider", min: 200, max: 3000, step: 50, default: 1000 },
+                                { id: "speed", label: "Answer Delay", type: "slider", min: 25, max: 3000, step: 25, default: 1000 },
                                 { id: "triviaDelay", label: "Trivia Answer Delay", type: "slider", min: 0, max: 8000, step: 50, default: 1500 },
                             ],
                         },
@@ -5803,6 +6130,13 @@
                             description: MODULE_DESCRIPTIONS[CAMERA_ZOOM_MODULE_NAME],
                             settings: [
                                 { id: "zoom", label: "Zoom", type: "slider", min: CAMERA_ZOOM_MIN, max: CAMERA_ZOOM_MAX, step: CAMERA_ZOOM_STEP, default: CAMERA_ZOOM_DEFAULT, unit: "x" },
+                            ],
+                        },
+                        {
+                            name: FREECAM_MODULE_NAME,
+                            description: MODULE_DESCRIPTIONS[FREECAM_MODULE_NAME],
+                            settings: [
+                                { id: "speed", label: "Move Speed", type: "slider", min: 1, max: 80, step: 1, default: 20, unit: "px" },
                             ],
                         },
                     ],
@@ -7394,7 +7728,7 @@
 
         function startAutoAnswer() {
             const cfg = moduleCfg("Auto Answer");
-            const speed = Math.max(200, Number(cfg.speed) || 1000);
+            const speed = Math.max(25, Number(cfg.speed) || 1000);
             const triviaDelayNumber = Number(cfg.triviaDelay);
             const triviaDelay = Math.max(0, Math.min(8000, Number.isFinite(triviaDelayNumber) ? triviaDelayNumber : 1500));
             window.__zyroxAutoAnswer?.start(speed, { pardyDelay: triviaDelay });
@@ -8549,8 +8883,12 @@
                 loosePanelPositions: state.loosePanelPositions,
                 collapsedPanels: state.collapsedPanels,
                 hiddenCategories: state.hiddenCategories,
-                enabledModules: Array.from(state.enabledModules),
-                moduleConfig: Array.from(ensureModuleConfigStore().entries()),
+                enabledModules: Array.from(state.enabledModules).filter((moduleName) => moduleName !== FREECAM_MODULE_NAME),
+                moduleConfig: Array.from(ensureModuleConfigStore().entries()).map(([moduleName, cfg]) => (
+                    moduleName === FREECAM_MODULE_NAME && cfg && typeof cfg === "object"
+                        ? [moduleName, { ...cfg, keybind: null }]
+                        : [moduleName, cfg]
+                )),
             };
         }
 
@@ -9513,6 +9851,9 @@
                             if (nextName === ABILITY_HUD_MODULE_NAME && nextCfg && typeof nextCfg === "object") {
                                 delete nextCfg.abilityHudEnabled; delete nextCfg.abilityHudPositionX; delete nextCfg.abilityHudPositionY; delete nextCfg.abilityHudZIndex; delete nextCfg.abilityHudOpacity;
                             }
+                            if (nextName === FREECAM_MODULE_NAME && nextCfg && typeof nextCfg === "object") {
+                                nextCfg.keybind = null;
+                            }
                             return [nextName, nextCfg];
                         });
                         state.moduleConfig = new Map(migratedModuleConfig);
@@ -9520,7 +9861,8 @@
                     if (Array.isArray(saved.enabledModules)) {
                         pendingEnabledModules = saved.enabledModules
                             .filter((name) => typeof name === "string")
-                            .map((name) => (name === LEGACY_ANIMATION_SKIP_MODULE_NAME ? ANIMATION_SKIP_MODULE_NAME : name));
+                            .map((name) => (name === LEGACY_ANIMATION_SKIP_MODULE_NAME ? ANIMATION_SKIP_MODULE_NAME : name))
+                            .filter((name) => name !== FREECAM_MODULE_NAME);
                     }
                     settingsMenuKeyBtn.textContent = `Menu Key: ${CONFIG.toggleKey}`;
                     setFooterText();
@@ -9650,6 +9992,7 @@
             }
 
             for (const [moduleName, cfg] of ensureModuleConfigStore()) {
+                if (moduleName === FREECAM_MODULE_NAME && !isGameplayReadyForFreecam()) continue;
                 if (cfg.keybind && cfg.keybind === event.key) {
                     toggleModule(moduleName);
                 }
