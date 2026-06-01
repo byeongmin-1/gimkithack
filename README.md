@@ -1,1 +1,1 @@
-# gimkithack
+u need tampermonkey
